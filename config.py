@@ -22,3 +22,15 @@ BOT_API_BASE_FILE_URL = os.getenv('BOT_API_BASE_FILE_URL')
 # then set its ID as BRIDGE_CHANNEL_ID.
 TG_SESSION_STRING = os.getenv('TG_SESSION_STRING')
 BRIDGE_CHANNEL_ID = int(os.getenv('BRIDGE_CHANNEL_ID', '0'))
+
+# Authorization settings
+_auth_users_raw = os.getenv('AUTHORIZED_USERS', '').strip()
+AUTHORIZED_USERS = set()
+if _auth_users_raw:
+    try:
+        AUTHORIZED_USERS = {int(x.strip()) for x in _auth_users_raw.split(',') if x.strip()}
+    except Exception:
+        # Ignore parse errors; will fall back to defaults in bot.py
+        AUTHORIZED_USERS = set()
+
+ALLOW_ALL = os.getenv('ALLOW_ALL', 'false').lower() in {'1', 'true', 'yes', 'on'}

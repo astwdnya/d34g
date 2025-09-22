@@ -8,8 +8,20 @@ from pathlib import Path
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
-from telegram.error import Conflict
-from config import BOT_TOKEN, BOT_API_BASE_URL, BOT_API_BASE_FILE_URL
+from telegram.error import Conflict, BadRequest, Forbidden
+from config import (
+    BOT_TOKEN,
+    BOT_API_BASE_URL,
+    BOT_API_BASE_FILE_URL,
+    TG_SESSION_STRING,
+    BRIDGE_CHANNEL_ID,
+    AUTHORIZED_USERS as CFG_AUTH_USERS,
+    ALLOW_ALL,
+)
+try:
+    from uploader import upload_to_bridge
+except Exception:
+    upload_to_bridge = None
 
 class TelegramDownloadBot:
     def __init__(self):
@@ -33,7 +45,9 @@ class TelegramDownloadBot:
 
         self.app = builder.build()
         # Authorized user IDs
-        self.authorized_users = {818185073, 6936101187, 7972834913}
+        default_users = {818185073, 6936101187, 7972834913}
+        self.authorized_users = set(CFG_AUTH_USERS) if CFG_AUTH_USERS else default_users
+        self.allow_all = bool(ALLOW_ALL)
         self.setup_handlers()
     
     def setup_handlers(self):
@@ -54,6 +68,8 @@ class TelegramDownloadBot:
     
     def is_authorized_user(self, user_id: int) -> bool:
         """Check if user is authorized to use the bot"""
+        if self.allow_all:
+            return True
         return user_id in self.authorized_users
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +154,7 @@ https://example.com/image.jpg
             
             # Upload with progress tracking - detect file type
             print(f"📤 Uploading file to Telegram for {user.first_name}")
-            await self.upload_with_progress(update, processing_msg, file_path, filename, file_size, user.first_name)
+            await self.upload_with_progress(update, context, processing_msg, file_path, filename, file_size, user.first_name)
             
             print(f"✅ File successfully sent to {user.first_name}: {filename}")
             
@@ -301,7 +317,7 @@ https://example.com/image.jpg
         s = round(bytes_per_second / p, 1)
         return f"{s} {speed_names[i]}"
     
-    async def upload_with_progress(self, update, progress_msg, file_path: str, filename: str, file_size: int, user_name: str):
+    async def upload_with_progress(self, update, context, progress_msg, file_path: str, filename: str, file_size: int, user_name: str):
         """Upload file with progress tracking"""
         start_time = time.time()
         
@@ -309,6 +325,37 @@ https://example.com/image.jpg
         progress_text = self.create_progress_text("📤 آپلود", 0, 0, 0, file_size)
         await progress_msg.edit_text(progress_text)
         
+        # If Local Bot API not configured and file > 50MB and bridge is configured, use user-account bridge
+        bridge_configured = bool(TG_SESSION_STRING) and BRIDGE_CHANNEL_ID != 0 and upload_to_bridge is not None
+        if not BOT_API_BASE_URL and file_size > 50 * 1024 * 1024 and bridge_configured:
+            try:
+                await progress_msg.edit_text("🚀 در حال ارسال از طریق حساب کاربری (بدون محدودیت 50MB)...")
+            except:
+                pass
+            try:
+                caption = f"✅ فایل آپلود شد (Bridge)\n📁 {filename}\n📊 {self.format_file_size(file_size)}"
+                bridge_chat_id, message_id = await upload_to_bridge(file_path, filename, caption)
+                await context.bot.copy_message(
+                    chat_id=update.effective_chat.id,
+                    from_chat_id=bridge_chat_id,
+                    message_id=message_id
+                )
+                try:
+                    await progress_msg.delete()
+                except:
+                    pass
+                return
+            except (BadRequest, Forbidden) as e:
+                await update.message.reply_text(
+                    "⚠️ دسترسی ربات به کانال Bridge مشکل دارد. ربات را ادمین کانال خصوصی قرار دهید و دوباره تلاش کنید."
+                )
+                raise e
+            except Exception as e:
+                await update.message.reply_text(
+                    f"⚠️ ارسال از طریق Bridge با خطا مواجه شد: {e}\nتلاش برای ارسال مستقیم از طریق Bot API..."
+                )
+                # continue to direct upload fallback
+
         # Note: To avoid truncated uploads, we stream the real file handle via InputFile
         # and let HTTPX handle chunking. This prevents calling read(-1) on a wrapper.
         
@@ -364,6 +411,7 @@ https://example.com/image.jpg
                 raise e
     
 
+
     async def delayed_file_cleanup(self, file_path: str, delay_seconds: int):
         """Delete file after specified delay"""
         try:
@@ -379,7 +427,28 @@ https://example.com/image.jpg
         print("🤖 Bot started successfully!")
         print("📊 Bot is now online and waiting for requests...")
         print("=" * 50)
-        self.app.run_polling(drop_pending_updates=True)
+        # Ensure any leftover webhook is removed so polling works
+        async def _post_init(app):
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                print("🔧 Webhook removed (if existed); polling enabled.")
+            except Exception as e:
+                print(f"⚠️ Could not delete webhook: {e}")
+            try:
+                me = await app.bot.get_me()
+                print(f"✅ Connected as @{me.username} (ID: {me.id})")
+                if BOT_API_BASE_URL:
+                    print(f"➡️ Using Bot API server: {BOT_API_BASE_URL}")
+                else:
+                    print("➡️ Using Telegram Cloud Bot API")
+                if self.allow_all:
+                    print("🔓 ALLOW_ALL is enabled (temporary). All users can use the bot.")
+                else:
+                    print(f"👤 Authorized users: {sorted(self.authorized_users)}")
+            except Exception as e:
+                print(f"⚠️ getMe failed: {e}")
+
+        self.app.run_polling(drop_pending_updates=True, post_init=_post_init)
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
