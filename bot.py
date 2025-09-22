@@ -7,11 +7,31 @@ from urllib.parse import urlparse
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from config import BOT_TOKEN
+from telegram.request import HTTPXRequest
+from telegram.error import Conflict
+from config import BOT_TOKEN, BOT_API_BASE_URL, BOT_API_BASE_FILE_URL
 
 class TelegramDownloadBot:
     def __init__(self):
-        self.app = Application.builder().token(BOT_TOKEN).build()
+        # Build Application with optional Local Bot API server
+        builder = Application.builder().token(BOT_TOKEN)
+        if BOT_API_BASE_URL:
+            # Point to local Bot API server to lift 50MB cloud limit (up to 2GB)
+            builder = builder.base_url(BOT_API_BASE_URL)
+            if BOT_API_BASE_FILE_URL:
+                builder = builder.base_file_url(BOT_API_BASE_FILE_URL)
+            # Increase timeouts for large media uploads
+            req = HTTPXRequest(
+                read_timeout=None,
+                write_timeout=None,
+                connect_timeout=30.0,
+                pool_timeout=30.0,
+                media_write_timeout=None,
+            )
+            builder = builder.request(req).get_updates_request(req)
+            print(f"🔗 Using Local Bot API server: {BOT_API_BASE_URL}")
+
+        self.app = builder.build()
         # Authorized user IDs
         self.authorized_users = {818185073, 6936101187, 7972834913}
         self.setup_handlers()
@@ -21,6 +41,16 @@ class TelegramDownloadBot:
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_link))
+        # Centralized error handler (e.g., for 409 Conflict)
+        self.app.add_error_handler(self.error_handler)
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Log errors globally to avoid noisy tracebacks and explain common cases."""
+        err = context.error
+        if isinstance(err, Conflict) or (err and "Conflict" in str(err)):
+            print("⚠️ Conflict: Another getUpdates request is running. Ensure only one bot instance is polling.")
+            return
+        print(f"⚠️ Unhandled error: {err}")
     
     def is_authorized_user(self, user_id: int) -> bool:
         """Check if user is authorized to use the bot"""
@@ -356,14 +386,29 @@ https://example.com/image.jpg
                 # If sending as media fails (413 error), fallback to document
                 if "413" in str(e) or "Request Entity Too Large" in str(e):
                     print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
-                    # Reset file pointer and send as document
+                    # Reset file pointer and try to send as document
                     file.seek(0)
                     progress_file = ProgressFile(file, file_size, progress_callback)
-                    await update.message.reply_document(
-                        document=progress_file,
-                        filename=filename,
-                        caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-                    )
+                    try:
+                        await update.message.reply_document(
+                            document=progress_file,
+                            filename=filename,
+                            caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+                        )
+                    except Exception as e2:
+                        # If even document fails with 413, inform user about Bot API cloud limit
+                        if "413" in str(e2) or "Request Entity Too Large" in str(e2):
+                            if not BOT_API_BASE_URL:
+                                await update.message.reply_text(
+                                    "⚠️ محدودیت 50MB در Bot API ابری. برای ارسال فایل‌های بزرگ (تا 2GB) باید Local Bot API Server را راه‌اندازی کنید و متغیرهای BOT_API_BASE_URL و BOT_API_BASE_FILE_URL را تنظیم کنید."
+                                )
+                            else:
+                                await update.message.reply_text(
+                                    "⚠️ ارسال فایل در حالت Local Bot API هم ناموفق بود. لطفاً پیکربندی سرور Local Bot API را بررسی کنید."
+                                )
+                        else:
+                            # Re-raise different errors
+                            raise e2
                 else:
                     # Re-raise other exceptions
                     raise e
