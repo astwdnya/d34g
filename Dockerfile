@@ -1,0 +1,25 @@
+# Multi-process container: Telegram Bot API server + Python bot
+# Base on image that already contains telegram-bot-api binary
+FROM aiogram/telegram-bot-api:latest
+
+# Install Python & build tools
+RUN apk add --no-cache python3 py3-pip bash curl build-base
+
+WORKDIR /app
+
+# Copy requirements and install
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# Copy app code
+COPY . /app
+
+# Default environment
+ENV PYTHONUNBUFFERED=1 \
+    HEALTH_PORT=10000
+
+# Start both the Bot API server and the Python bot
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]

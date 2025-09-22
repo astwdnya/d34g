@@ -30,9 +30,10 @@ def main():
     try:
         logger.info("Starting Telegram Download Bot with Health Server...")
         
-        # Start health check server
+        # Start health check server (bind to HEALTH_PORT, not Render PORT)
         from health_server import HealthServer
-        health_server = HealthServer(port=int(os.environ.get('PORT', 8080)))
+        health_port = int(os.environ.get('HEALTH_PORT', 10000))
+        health_server = HealthServer(port=health_port)
         health_server.start()
         health_server.update_bot_status("initializing")
         
