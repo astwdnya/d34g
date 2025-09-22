@@ -213,7 +213,7 @@ https://example.com/image.jpg
         print("🤖 Bot started successfully!")
         print("📊 Bot is now online and waiting for requests...")
         print("=" * 50)
-        self.app.run_polling(allowed_updates=Update.ALL_TYPES)
+        self.app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
