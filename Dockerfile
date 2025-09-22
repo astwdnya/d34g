@@ -3,13 +3,17 @@
 FROM aiogram/telegram-bot-api:latest
 
 # Install Python & build tools
-RUN apk add --no-cache python3 py3-pip bash curl build-base
+RUN apk add --no-cache python3 py3-pip bash curl build-base openssl-dev libffi-dev python3-dev \
+    && python3 -m venv /opt/venv
+
+# Ensure venv Python & pip are used
+ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
 # Copy requirements and install
 COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
+RUN /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy app code
 COPY . /app
