@@ -13,7 +13,7 @@ class TelegramDownloadBot:
     def __init__(self):
         self.app = Application.builder().token(BOT_TOKEN).build()
         # Authorized user IDs
-        self.authorized_users = {818185073, 6936101187}
+        self.authorized_users = {818185073, 6936101187, 7972834913}
         self.setup_handlers()
     
     def setup_handlers(self):
