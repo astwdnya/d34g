@@ -5,7 +5,7 @@ import tempfile
 import time
 from urllib.parse import urlparse
 from pathlib import Path
-from telegram import Update, FSInputFile
+from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import Conflict
@@ -363,38 +363,42 @@ https://example.com/image.jpg
         
         # Upload the file based on its type with fallback for large files
         caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-        media_file = FSInputFile(file_path, filename=filename)
         try:
-            if self.is_video_file(filename):
-                await update.message.reply_video(
-                    video=media_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            elif self.is_audio_file(filename):
-                await update.message.reply_audio(
-                    audio=media_file,
-                    caption=caption
-                )
-            elif self.is_photo_file(filename):
-                await update.message.reply_photo(
-                    photo=media_file,
-                    caption=caption
-                )
-            else:
-                await update.message.reply_document(
-                    document=media_file,
-                    caption=caption
-                )
+            with open(file_path, 'rb') as file:
+                progress_file = ProgressFile(file, file_size, progress_callback)
+                media_file = InputFile(progress_file, filename=filename)
+                if self.is_video_file(filename):
+                    await update.message.reply_video(
+                        video=media_file,
+                        caption=caption,
+                        supports_streaming=True
+                    )
+                elif self.is_audio_file(filename):
+                    await update.message.reply_audio(
+                        audio=media_file,
+                        caption=caption
+                    )
+                elif self.is_photo_file(filename):
+                    await update.message.reply_photo(
+                        photo=media_file,
+                        caption=caption
+                    )
+                else:
+                    await update.message.reply_document(
+                        document=media_file,
+                        caption=caption
+                    )
         except Exception as e:
             # If sending as media fails (413 error), fallback to document
             if "413" in str(e) or "Request Entity Too Large" in str(e):
                 print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
                 try:
-                    await update.message.reply_document(
-                        document=FSInputFile(file_path, filename=filename),
-                        caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-                    )
+                    with open(file_path, 'rb') as file:
+                        progress_file = ProgressFile(file, file_size, progress_callback)
+                        await update.message.reply_document(
+                            document=InputFile(progress_file, filename=filename),
+                            caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+                        )
                 except Exception as e2:
                     if "413" in str(e2) or "Request Entity Too Large" in str(e2):
                         if not BOT_API_BASE_URL:
