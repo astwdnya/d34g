@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Telegram API credentials
-API_ID = int(os.getenv('API_ID', '2040'))
-API_HASH = os.getenv('API_HASH', 'b18441a1ff607e10a989891a5462e627')
-BOT_TOKEN = '7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc'  # Your bot token
+API_ID = int(os.getenv('API_ID', '23598202'))
+API_HASH = os.getenv('API_HASH', '27c57538146f68a1c52a2651b51ec43c')
+BOT_TOKEN = os.getenv('BOT_TOKEN')  # Read from environment for security
 
 # Optional: Use a Local Bot API server (to send files up to 2GB)
 # If you run a local telegram-bot-api server, set these in your .env:
