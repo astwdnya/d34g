@@ -25,14 +25,15 @@ telegram-bot-api \
 # Wait for the Bot API server to become ready (max ~60s)
 echo "Waiting for Bot API server on 127.0.0.1:${PORT}..."
 for i in $(seq 1 60); do
-  if curl -sSf -o /dev/null "http://127.0.0.1:${PORT}/"; then
-    if [[ -n "${BOT_TOKEN:-}" ]]; then
-      # Optional: sanity check getMe
-      if curl -sSf -o /dev/null "http://127.0.0.1:${PORT}/bot${BOT_TOKEN}/getMe"; then
-        echo "Bot API is ready (getMe ok)."
-        break
-      fi
-    else
+  if [[ -n "${BOT_TOKEN:-}" ]]; then
+    code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/bot${BOT_TOKEN}/getMe" || true)
+    if echo "$code" | grep -Eq '^(200|401)$'; then
+      echo "Bot API is reachable (HTTP $code)."
+      break
+    fi
+  else
+    # No token provided: consider any HTTP response from root as success
+    if curl -sS -o /dev/null "http://127.0.0.1:${PORT}/"; then
       echo "Bot API root reachable."
       break
     fi
