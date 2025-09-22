@@ -23,8 +23,23 @@ telegram-bot-api \
   --dir=/var/lib/telegram-bot-api \
   --temp-dir=/tmp/telegram-bot-api &
 
-# Give the server a moment to boot
-sleep 2
+# Wait for the Bot API server to become ready (max ~60s)
+echo "Waiting for Bot API server on 127.0.0.1:${PORT}..."
+for i in $(seq 1 60); do
+  if curl -sSf -o /dev/null "http://127.0.0.1:${PORT}/"; then
+    if [[ -n "${BOT_TOKEN:-}" ]]; then
+      # Optional: sanity check getMe
+      if curl -sSf -o /dev/null "http://127.0.0.1:${PORT}/bot${BOT_TOKEN}/getMe"; then
+        echo "Bot API is ready (getMe ok)."
+        break
+      fi
+    else
+      echo "Bot API root reachable."
+      break
+    fi
+  fi
+  sleep 1
+done
 
 # Point our Python bot to the local Bot API server inside the container, unless already set
 export BOT_API_BASE_URL="${BOT_API_BASE_URL:-http://127.0.0.1:${PORT}/bot}"

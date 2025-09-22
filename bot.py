@@ -54,6 +54,7 @@ class TelegramDownloadBot:
         """Setup command and message handlers"""
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("id", self.id_command))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_link))
         # Centralized error handler (e.g., for 409 Conflict)
         self.app.add_error_handler(self.error_handler)
@@ -79,7 +80,10 @@ class TelegramDownloadBot:
         
         # Check if user is authorized - silently ignore if not
         if not self.is_authorized_user(user.id):
-            print(f"🚫 Unauthorized access attempt by {user.first_name} (ID: {user.id}) - ignored")
+            print(f"🚫 Unauthorized access attempt by {user.first_name} (ID: {user.id})")
+            await update.message.reply_text(
+                f"🚫 دسترسی شما مجاز نیست.\nشناسه شما: {user.id}\nاز ادمین بخواهید شما را به لیست مجاز اضافه کند یا موقتاً ALLOW_ALL را فعال کند."
+            )
             return
         
         welcome_message = """
@@ -121,6 +125,12 @@ https://example.com/image.jpg
         await update.message.reply_text(help_message)
         print(f"✅ Help message sent to {user.first_name}")
     
+    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Return user's Telegram ID for whitelisting"""
+        user = update.effective_user
+        await update.message.reply_text(f"🆔 شناسه کاربری شما: {user.id}")
+        print(f"ℹ️ /id requested by {user.first_name} - ID: {user.id}")
+
     async def handle_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle download links sent by users"""
         user = update.effective_user
@@ -131,7 +141,10 @@ https://example.com/image.jpg
         
         # Check if user is authorized - silently ignore if not
         if not self.is_authorized_user(user.id):
-            print(f"🚫 Unauthorized download request by {user.first_name} (ID: {user.id}) - ignored")
+            print(f"🚫 Unauthorized download request by {user.first_name} (ID: {user.id})")
+            await update.message.reply_text(
+                f"🚫 دسترسی شما مجاز نیست.\nشناسه شما: {user.id}\nاز ادمین بخواهید شما را به لیست مجاز اضافه کند یا موقتاً ALLOW_ALL را فعال کند."
+            )
             return
         
         # Check if the message contains a valid URL
