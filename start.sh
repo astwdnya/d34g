@@ -19,7 +19,6 @@ telegram-bot-api \
   --api-id="${TELEGRAM_API_ID}" \
   --api-hash="${TELEGRAM_API_HASH}" \
   --http-port="${PORT}" \
-  --http-listen=0.0.0.0 \
   --dir=/var/lib/telegram-bot-api \
   --temp-dir=/tmp/telegram-bot-api &
 

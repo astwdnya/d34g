@@ -43,6 +43,28 @@ class TelegramDownloadBot:
             builder = builder.request(req).get_updates_request(req)
             print(f"🔗 Using Local Bot API server: {BOT_API_BASE_URL}")
 
+        # Define a post_init hook to run after application initialization
+        async def _post_init(app):
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                print("🔧 Webhook removed (if existed); polling enabled.")
+            except Exception as e:
+                print(f"⚠️ Could not delete webhook: {e}")
+            try:
+                me = await app.bot.get_me()
+                print(f"✅ Connected as @{me.username} (ID: {me.id})")
+                if BOT_API_BASE_URL:
+                    print(f"➡️ Using Bot API server: {BOT_API_BASE_URL}")
+                else:
+                    print("➡️ Using Telegram Cloud Bot API")
+                if self.allow_all:
+                    print("🔓 ALLOW_ALL is enabled (temporary). All users can use the bot.")
+                else:
+                    print(f"👤 Authorized users: {sorted(self.authorized_users)}")
+            except Exception as e:
+                print(f"⚠️ getMe failed: {e}")
+
+        builder = builder.post_init(_post_init)
         self.app = builder.build()
         # Authorized user IDs
         default_users = {818185073, 6936101187, 7972834913}
@@ -440,28 +462,7 @@ https://example.com/image.jpg
         print("🤖 Bot started successfully!")
         print("📊 Bot is now online and waiting for requests...")
         print("=" * 50)
-        # Ensure any leftover webhook is removed so polling works
-        async def _post_init(app):
-            try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
-                print("🔧 Webhook removed (if existed); polling enabled.")
-            except Exception as e:
-                print(f"⚠️ Could not delete webhook: {e}")
-            try:
-                me = await app.bot.get_me()
-                print(f"✅ Connected as @{me.username} (ID: {me.id})")
-                if BOT_API_BASE_URL:
-                    print(f"➡️ Using Bot API server: {BOT_API_BASE_URL}")
-                else:
-                    print("➡️ Using Telegram Cloud Bot API")
-                if self.allow_all:
-                    print("🔓 ALLOW_ALL is enabled (temporary). All users can use the bot.")
-                else:
-                    print(f"👤 Authorized users: {sorted(self.authorized_users)}")
-            except Exception as e:
-                print(f"⚠️ getMe failed: {e}")
-
-        self.app.run_polling(drop_pending_updates=True, post_init=_post_init)
+        self.app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
