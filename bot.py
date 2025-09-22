@@ -65,7 +65,7 @@ class TelegramDownloadBot:
 
 ⚠️ نکات مهم:
 • لینک باید مستقیم باشه (نه لینک صفحه)
-• حداکثر حجم فایل: 2 گیگابایت
+• بدون محدودیت حجم فایل
 • فرمت‌های پشتیبانی شده: تمام فرمت‌ها
 
 مثال لینک معتبر:
@@ -104,14 +104,9 @@ https://example.com/image.jpg
             file_path, filename, file_size = await self.download_file(url, processing_msg, user.first_name)
             print(f"✅ File downloaded successfully: {filename} ({self.format_file_size(file_size)})")
             
-            # Check file size (Updated limit to 2GB)
-            if file_size > 2 * 1024 * 1024 * 1024:  # 2GB in bytes
-                print(f"❌ File too large ({self.format_file_size(file_size)}) - rejected")
-                await processing_msg.edit_text("❌ حجم فایل بیش از 2 گیگابایت است!")
-                os.unlink(file_path)  # Delete the downloaded file
-                return
+            # No file size limit - removed all restrictions
             
-            # Upload with progress tracking
+            # Upload with progress tracking - detect file type
             print(f"📤 Uploading file to Telegram for {user.first_name}")
             await self.upload_with_progress(update, processing_msg, file_path, filename, file_size, user.first_name)
             
@@ -138,8 +133,12 @@ https://example.com/image.jpg
     
     async def download_file(self, url: str, progress_msg=None, user_name: str = "") -> tuple:
         """Download file from URL with progress tracking"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+        # Configure session with no size limits
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+        
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            async with session.get(url, allow_redirects=True) as response:
                 if response.status != 200:
                     raise Exception(f"HTTP {response.status}: نمی‌توان فایل را دانلود کرد")
                 
@@ -151,13 +150,13 @@ https://example.com/image.jpg
                 temp_dir = tempfile.gettempdir()
                 file_path = os.path.join(temp_dir, filename)
                 
-                # Download with progress tracking
+                # Download with progress tracking - no size limits
                 downloaded = 0
                 start_time = time.time()
                 last_update = 0
                 
                 with open(file_path, 'wb') as file:
-                    async for chunk in response.content.iter_chunked(8192):
+                    async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks for large files
                         file.write(chunk)
                         downloaded += len(chunk)
                         
@@ -212,6 +211,30 @@ https://example.com/image.jpg
         p = math.pow(1024, i)
         s = round(size_bytes / p, 2)
         return f"{s} {size_names[i]}"
+    
+    def is_video_file(self, filename: str) -> bool:
+        """Check if file is a video based on extension"""
+        video_extensions = {
+            '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', 
+            '.m4v', '.3gp', '.ogv', '.ts', '.mts', '.m2ts'
+        }
+        return any(filename.lower().endswith(ext) for ext in video_extensions)
+    
+    def is_audio_file(self, filename: str) -> bool:
+        """Check if file is audio based on extension"""
+        audio_extensions = {
+            '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', 
+            '.opus', '.aiff', '.au', '.ra'
+        }
+        return any(filename.lower().endswith(ext) for ext in audio_extensions)
+    
+    def is_photo_file(self, filename: str) -> bool:
+        """Check if file is a photo based on extension"""
+        photo_extensions = {
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', 
+            '.tiff', '.tif', '.svg', '.ico'
+        }
+        return any(filename.lower().endswith(ext) for ext in photo_extensions)
     
     def create_progress_text(self, action: str, percentage: float, speed: float, current: int, total: int) -> str:
         """Create progress text with bar and stats"""
@@ -297,15 +320,39 @@ https://example.com/image.jpg
                 except:
                     pass
         
-        # Upload the file
+        # Upload the file based on its type
         with open(file_path, 'rb') as file:
             progress_file = ProgressFile(file, file_size, progress_callback)
-            await update.message.reply_document(
-                document=progress_file,
-                filename=filename,
-                caption=f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-            )
+            caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+            
+            if self.is_video_file(filename):
+                # Send as video
+                await update.message.reply_video(
+                    video=progress_file,
+                    caption=caption,
+                    supports_streaming=True
+                )
+            elif self.is_audio_file(filename):
+                # Send as audio
+                await update.message.reply_audio(
+                    audio=progress_file,
+                    caption=caption
+                )
+            elif self.is_photo_file(filename):
+                # Send as photo
+                await update.message.reply_photo(
+                    photo=progress_file,
+                    caption=caption
+                )
+            else:
+                # Send as document for other file types
+                await update.message.reply_document(
+                    document=progress_file,
+                    filename=filename,
+                    caption=caption
+                )
     
+
     async def delayed_file_cleanup(self, file_path: str, delay_seconds: int):
         """Delete file after specified delay"""
         try:
