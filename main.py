@@ -7,7 +7,6 @@ Optimized for Render deployment with health check server
 import os
 import sys
 import logging
-import asyncio
 from pathlib import Path
 
 # Add the tgscmr directory to Python path
@@ -26,7 +25,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-async def main():
+def main():
     """Main function to start the bot with health server"""
     try:
         logger.info("Starting Telegram Download Bot with Health Server...")
@@ -45,23 +44,12 @@ async def main():
         logger.info("Bot instance created successfully")
         health_server.update_bot_status("created")
         
-        # Initialize the application
-        await bot.app.initialize()
-        logger.info("Bot initialized successfully")
-        health_server.update_bot_status("initialized")
-        
         # Start the bot
-        await bot.app.start()
-        logger.info("Bot started successfully")
-        health_server.update_bot_status("started")
-        
-        # Start polling
-        await bot.app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Bot is now polling for updates...")
+        logger.info("Starting bot polling...")
         health_server.update_bot_status("running")
         
-        # Keep the bot running
-        await asyncio.Event().wait()
+        # Use the simplified run method
+        bot.run()
         
     except ImportError as e:
         logger.error(f"Import error: {e}")
@@ -75,4 +63,4 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
