@@ -309,64 +309,14 @@ https://example.com/image.jpg
         progress_text = self.create_progress_text("📤 آپلود", 0, 0, 0, file_size)
         await progress_msg.edit_text(progress_text)
         
-        # Create a custom progress callback
-        uploaded = 0
-        last_update = 0
-        
-        class ProgressFile:
-            def __init__(self, file_obj, total_size, callback):
-                self.file_obj = file_obj
-                self.total_size = total_size
-                self.callback = callback
-                self.uploaded = 0
-                # Read in bounded chunks to avoid loading the whole file into memory
-                self.chunk_size = 512 * 1024  # 512 KB per read
-                # Throttle progress callback to reduce task churn
-                self._last_cb_time = 0.0
-                
-            def read(self, size=-1):
-                # Some HTTP clients call read() with size=-1 (read all). Cap it.
-                if size is None or size < 0 or size > self.chunk_size:
-                    size = self.chunk_size
-                data = self.file_obj.read(size)
-                if data:
-                    self.uploaded += len(data)
-                    now = time.time()
-                    # Fire progress at most twice per second or on completion
-                    if (now - self._last_cb_time) >= 0.5 or self.uploaded >= self.total_size:
-                        self._last_cb_time = now
-                        asyncio.create_task(self.callback(self.uploaded, self.total_size))
-                return data
-                
-            def __getattr__(self, name):
-                return getattr(self.file_obj, name)
-        
-        async def progress_callback(current, total):
-            nonlocal last_update
-            current_time = time.time()
-            
-            if current_time - last_update >= 1:  # Update every second for upload
-                elapsed_time = current_time - start_time
-                speed = current / elapsed_time if elapsed_time > 0 else 0
-                percentage = (current / total) * 100 if total > 0 else 0
-                
-                progress_text = self.create_progress_text(
-                    "📤 آپلود", percentage, speed, current, total
-                )
-                
-                try:
-                    await progress_msg.edit_text(progress_text)
-                    last_update = current_time
-                    print(f"📊 Upload progress for {user_name}: {percentage:.1f}% - {self.format_speed(speed)}")
-                except:
-                    pass
+        # Note: To avoid truncated uploads, we stream the real file handle via InputFile
+        # and let HTTPX handle chunking. This prevents calling read(-1) on a wrapper.
         
         # Upload the file based on its type with fallback for large files
         caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
         try:
             with open(file_path, 'rb') as file:
-                progress_file = ProgressFile(file, file_size, progress_callback)
-                media_file = InputFile(progress_file, filename=filename)
+                media_file = InputFile(file, filename=filename, read_file_handle=False)
                 if self.is_video_file(filename):
                     await update.message.reply_video(
                         video=media_file,
@@ -394,9 +344,8 @@ https://example.com/image.jpg
                 print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
                 try:
                     with open(file_path, 'rb') as file:
-                        progress_file = ProgressFile(file, file_size, progress_callback)
                         await update.message.reply_document(
-                            document=InputFile(progress_file, filename=filename),
+                            document=InputFile(file, filename=filename, read_file_handle=False),
                             caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
                         )
                 except Exception as e2:
