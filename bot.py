@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 import tempfile
+import time
 from urllib.parse import urlparse
 from pathlib import Path
 from telegram import Update
@@ -98,9 +99,9 @@ https://example.com/image.jpg
         processing_msg = await update.message.reply_text("⏳ در حال دانلود فایل...")
         
         try:
-            # Download the file
+            # Download the file with progress
             print(f"📥 Downloading file from: {url}")
-            file_path, filename, file_size = await self.download_file(url)
+            file_path, filename, file_size = await self.download_file(url, processing_msg, user.first_name)
             print(f"✅ File downloaded successfully: {filename} ({self.format_file_size(file_size)})")
             
             # Check file size (Updated limit to 2GB)
@@ -110,17 +111,9 @@ https://example.com/image.jpg
                 os.unlink(file_path)  # Delete the downloaded file
                 return
             
-            # Update message
-            await processing_msg.edit_text("📤 در حال ارسال فایل...")
+            # Upload with progress tracking
             print(f"📤 Uploading file to Telegram for {user.first_name}")
-            
-            # Send the file
-            with open(file_path, 'rb') as file:
-                await update.message.reply_document(
-                    document=file,
-                    filename=filename,
-                    caption=f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-                )
+            await self.upload_with_progress(update, processing_msg, file_path, filename, file_size, user.first_name)
             
             print(f"✅ File successfully sent to {user.first_name}: {filename}")
             
@@ -143,28 +136,50 @@ https://example.com/image.jpg
         except:
             return False
     
-    async def download_file(self, url: str) -> tuple:
-        """Download file from URL and return file path, filename, and size"""
+    async def download_file(self, url: str, progress_msg=None, user_name: str = "") -> tuple:
+        """Download file from URL with progress tracking"""
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     raise Exception(f"HTTP {response.status}: نمی‌توان فایل را دانلود کرد")
                 
-                # Get filename from URL or Content-Disposition header
+                # Get filename and total size
                 filename = self.get_filename_from_response(response, url)
+                total_size = int(response.headers.get('content-length', 0))
                 
                 # Create temporary file
                 temp_dir = tempfile.gettempdir()
                 file_path = os.path.join(temp_dir, filename)
                 
-                # Download file
-                total_size = 0
+                # Download with progress tracking
+                downloaded = 0
+                start_time = time.time()
+                last_update = 0
+                
                 with open(file_path, 'wb') as file:
                     async for chunk in response.content.iter_chunked(8192):
                         file.write(chunk)
-                        total_size += len(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Update progress every 2 seconds
+                        current_time = time.time()
+                        if current_time - last_update >= 2 and progress_msg and total_size > 0:
+                            elapsed_time = current_time - start_time
+                            speed = downloaded / elapsed_time if elapsed_time > 0 else 0
+                            percentage = (downloaded / total_size) * 100
+                            
+                            progress_text = self.create_progress_text(
+                                "📥 دانلود", percentage, speed, downloaded, total_size
+                            )
+                            
+                            try:
+                                await progress_msg.edit_text(progress_text)
+                                last_update = current_time
+                                print(f"📊 Download progress for {user_name}: {percentage:.1f}% - {self.format_speed(speed)}")
+                            except:
+                                pass  # Ignore edit errors
                 
-                return file_path, filename, total_size
+                return file_path, filename, downloaded
     
     def get_filename_from_response(self, response, url: str) -> str:
         """Extract filename from response headers or URL"""
@@ -197,6 +212,99 @@ https://example.com/image.jpg
         p = math.pow(1024, i)
         s = round(size_bytes / p, 2)
         return f"{s} {size_names[i]}"
+    
+    def create_progress_text(self, action: str, percentage: float, speed: float, current: int, total: int) -> str:
+        """Create progress text with bar and stats"""
+        # Create progress bar
+        bar_length = 20
+        filled_length = int(bar_length * percentage / 100)
+        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+        
+        # Format text
+        speed_text = self.format_speed(speed)
+        current_size = self.format_file_size(current)
+        total_size = self.format_file_size(total)
+        
+        return f"""{action} در حال انجام...
+
+{bar} {percentage:.1f}%
+
+📊 حجم: {current_size} / {total_size}
+🚀 سرعت: {speed_text}
+
+لطفاً صبر کنید..."""
+    
+    def format_speed(self, bytes_per_second: float) -> str:
+        """Format speed in human readable format"""
+        if bytes_per_second == 0:
+            return "0 B/s"
+        
+        speed_names = ["B/s", "KB/s", "MB/s", "GB/s"]
+        import math
+        i = int(math.floor(math.log(bytes_per_second, 1024)))
+        if i >= len(speed_names):
+            i = len(speed_names) - 1
+        p = math.pow(1024, i)
+        s = round(bytes_per_second / p, 1)
+        return f"{s} {speed_names[i]}"
+    
+    async def upload_with_progress(self, update, progress_msg, file_path: str, filename: str, file_size: int, user_name: str):
+        """Upload file with progress tracking"""
+        start_time = time.time()
+        
+        # Show initial upload message
+        progress_text = self.create_progress_text("📤 آپلود", 0, 0, 0, file_size)
+        await progress_msg.edit_text(progress_text)
+        
+        # Create a custom progress callback
+        uploaded = 0
+        last_update = 0
+        
+        class ProgressFile:
+            def __init__(self, file_obj, total_size, callback):
+                self.file_obj = file_obj
+                self.total_size = total_size
+                self.callback = callback
+                self.uploaded = 0
+                
+            def read(self, size=-1):
+                data = self.file_obj.read(size)
+                if data:
+                    self.uploaded += len(data)
+                    asyncio.create_task(self.callback(self.uploaded, self.total_size))
+                return data
+                
+            def __getattr__(self, name):
+                return getattr(self.file_obj, name)
+        
+        async def progress_callback(current, total):
+            nonlocal last_update
+            current_time = time.time()
+            
+            if current_time - last_update >= 1:  # Update every second for upload
+                elapsed_time = current_time - start_time
+                speed = current / elapsed_time if elapsed_time > 0 else 0
+                percentage = (current / total) * 100 if total > 0 else 0
+                
+                progress_text = self.create_progress_text(
+                    "📤 آپلود", percentage, speed, current, total
+                )
+                
+                try:
+                    await progress_msg.edit_text(progress_text)
+                    last_update = current_time
+                    print(f"📊 Upload progress for {user_name}: {percentage:.1f}% - {self.format_speed(speed)}")
+                except:
+                    pass
+        
+        # Upload the file
+        with open(file_path, 'rb') as file:
+            progress_file = ProgressFile(file, file_size, progress_callback)
+            await update.message.reply_document(
+                document=progress_file,
+                filename=filename,
+                caption=f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+            )
     
     async def delayed_file_cleanup(self, file_path: str, delay_seconds: int):
         """Delete file after specified delay"""
