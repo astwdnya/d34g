@@ -5,7 +5,7 @@ import tempfile
 import time
 from urllib.parse import urlparse
 from pathlib import Path
-from telegram import Update
+from telegram import Update, FSInputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import Conflict
@@ -319,12 +319,23 @@ https://example.com/image.jpg
                 self.total_size = total_size
                 self.callback = callback
                 self.uploaded = 0
+                # Read in bounded chunks to avoid loading the whole file into memory
+                self.chunk_size = 512 * 1024  # 512 KB per read
+                # Throttle progress callback to reduce task churn
+                self._last_cb_time = 0.0
                 
             def read(self, size=-1):
+                # Some HTTP clients call read() with size=-1 (read all). Cap it.
+                if size is None or size < 0 or size > self.chunk_size:
+                    size = self.chunk_size
                 data = self.file_obj.read(size)
                 if data:
                     self.uploaded += len(data)
-                    asyncio.create_task(self.callback(self.uploaded, self.total_size))
+                    now = time.time()
+                    # Fire progress at most twice per second or on completion
+                    if (now - self._last_cb_time) >= 0.5 or self.uploaded >= self.total_size:
+                        self._last_cb_time = now
+                        asyncio.create_task(self.callback(self.uploaded, self.total_size))
                 return data
                 
             def __getattr__(self, name):
@@ -351,67 +362,53 @@ https://example.com/image.jpg
                     pass
         
         # Upload the file based on its type with fallback for large files
-        with open(file_path, 'rb') as file:
-            progress_file = ProgressFile(file, file_size, progress_callback)
-            caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-            
-            try:
-                if self.is_video_file(filename):
-                    # Try to send as video first
-                    await update.message.reply_video(
-                        video=progress_file,
-                        caption=caption,
-                        supports_streaming=True
-                    )
-                elif self.is_audio_file(filename):
-                    # Try to send as audio first
-                    await update.message.reply_audio(
-                        audio=progress_file,
-                        caption=caption
-                    )
-                elif self.is_photo_file(filename):
-                    # Try to send as photo first
-                    await update.message.reply_photo(
-                        photo=progress_file,
-                        caption=caption
-                    )
-                else:
-                    # Send as document for other file types
+        caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+        media_file = FSInputFile(file_path, filename=filename)
+        try:
+            if self.is_video_file(filename):
+                await update.message.reply_video(
+                    video=media_file,
+                    caption=caption,
+                    supports_streaming=True
+                )
+            elif self.is_audio_file(filename):
+                await update.message.reply_audio(
+                    audio=media_file,
+                    caption=caption
+                )
+            elif self.is_photo_file(filename):
+                await update.message.reply_photo(
+                    photo=media_file,
+                    caption=caption
+                )
+            else:
+                await update.message.reply_document(
+                    document=media_file,
+                    caption=caption
+                )
+        except Exception as e:
+            # If sending as media fails (413 error), fallback to document
+            if "413" in str(e) or "Request Entity Too Large" in str(e):
+                print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
+                try:
                     await update.message.reply_document(
-                        document=progress_file,
-                        filename=filename,
-                        caption=caption
+                        document=FSInputFile(file_path, filename=filename),
+                        caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
                     )
-            except Exception as e:
-                # If sending as media fails (413 error), fallback to document
-                if "413" in str(e) or "Request Entity Too Large" in str(e):
-                    print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
-                    # Reset file pointer and try to send as document
-                    file.seek(0)
-                    progress_file = ProgressFile(file, file_size, progress_callback)
-                    try:
-                        await update.message.reply_document(
-                            document=progress_file,
-                            filename=filename,
-                            caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
-                        )
-                    except Exception as e2:
-                        # If even document fails with 413, inform user about Bot API cloud limit
-                        if "413" in str(e2) or "Request Entity Too Large" in str(e2):
-                            if not BOT_API_BASE_URL:
-                                await update.message.reply_text(
-                                    "⚠️ محدودیت 50MB در Bot API ابری. برای ارسال فایل‌های بزرگ (تا 2GB) باید Local Bot API Server را راه‌اندازی کنید و متغیرهای BOT_API_BASE_URL و BOT_API_BASE_FILE_URL را تنظیم کنید."
-                                )
-                            else:
-                                await update.message.reply_text(
-                                    "⚠️ ارسال فایل در حالت Local Bot API هم ناموفق بود. لطفاً پیکربندی سرور Local Bot API را بررسی کنید."
-                                )
+                except Exception as e2:
+                    if "413" in str(e2) or "Request Entity Too Large" in str(e2):
+                        if not BOT_API_BASE_URL:
+                            await update.message.reply_text(
+                                "⚠️ محدودیت 50MB در Bot API ابری. برای ارسال فایل‌های بزرگ (تا 2GB) باید Local Bot API Server را راه‌اندازی کنید و متغیرهای BOT_API_BASE_URL و BOT_API_BASE_FILE_URL را تنظیم کنید."
+                            )
                         else:
-                            # Re-raise different errors
-                            raise e2
-                else:
-                    # Re-raise other exceptions
-                    raise e
+                            await update.message.reply_text(
+                                "⚠️ ارسال فایل در حالت Local Bot API هم ناموفق بود. لطفاً پیکربندی سرور Local Bot API را بررسی کنید."
+                            )
+                    else:
+                        raise e2
+            else:
+                raise e
     
 
     async def delayed_file_cleanup(self, file_path: str, delay_seconds: int):
