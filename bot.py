@@ -320,37 +320,53 @@ https://example.com/image.jpg
                 except:
                     pass
         
-        # Upload the file based on its type
+        # Upload the file based on its type with fallback for large files
         with open(file_path, 'rb') as file:
             progress_file = ProgressFile(file, file_size, progress_callback)
             caption = f"✅ فایل با موفقیت دانلود شد!\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
             
-            if self.is_video_file(filename):
-                # Send as video
-                await update.message.reply_video(
-                    video=progress_file,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            elif self.is_audio_file(filename):
-                # Send as audio
-                await update.message.reply_audio(
-                    audio=progress_file,
-                    caption=caption
-                )
-            elif self.is_photo_file(filename):
-                # Send as photo
-                await update.message.reply_photo(
-                    photo=progress_file,
-                    caption=caption
-                )
-            else:
-                # Send as document for other file types
-                await update.message.reply_document(
-                    document=progress_file,
-                    filename=filename,
-                    caption=caption
-                )
+            try:
+                if self.is_video_file(filename):
+                    # Try to send as video first
+                    await update.message.reply_video(
+                        video=progress_file,
+                        caption=caption,
+                        supports_streaming=True
+                    )
+                elif self.is_audio_file(filename):
+                    # Try to send as audio first
+                    await update.message.reply_audio(
+                        audio=progress_file,
+                        caption=caption
+                    )
+                elif self.is_photo_file(filename):
+                    # Try to send as photo first
+                    await update.message.reply_photo(
+                        photo=progress_file,
+                        caption=caption
+                    )
+                else:
+                    # Send as document for other file types
+                    await update.message.reply_document(
+                        document=progress_file,
+                        filename=filename,
+                        caption=caption
+                    )
+            except Exception as e:
+                # If sending as media fails (413 error), fallback to document
+                if "413" in str(e) or "Request Entity Too Large" in str(e):
+                    print(f"⚠️ Media upload failed due to size limit, falling back to document: {filename}")
+                    # Reset file pointer and send as document
+                    file.seek(0)
+                    progress_file = ProgressFile(file, file_size, progress_callback)
+                    await update.message.reply_document(
+                        document=progress_file,
+                        filename=filename,
+                        caption=f"📄 فایل به صورت سند ارسال شد (حجم بزرگ)\n📁 نام فایل: {filename}\n📊 حجم: {self.format_file_size(file_size)}"
+                    )
+                else:
+                    # Re-raise other exceptions
+                    raise e
     
 
     async def delayed_file_cleanup(self, file_path: str, delay_seconds: int):
