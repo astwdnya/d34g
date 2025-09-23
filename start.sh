@@ -13,6 +13,12 @@ fi
 # Ports
 PORT="${PORT:-8081}"
 HEALTH_PORT="${HEALTH_PORT:-10000}"
+# If Render assigned PORT equals HEALTH_PORT, move health to a different port to avoid conflict
+if [ "$HEALTH_PORT" = "$PORT" ]; then
+  NEW_HEALTH=$((PORT + 1))
+  echo "HEALTH_PORT ($HEALTH_PORT) equals PORT ($PORT). Using $NEW_HEALTH for health server instead."
+  HEALTH_PORT="$NEW_HEALTH"
+fi
 
 # Start Telegram Bot API server (listens on Render PORT)
 telegram-bot-api \
