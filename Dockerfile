@@ -2,14 +2,27 @@
 # Base on image that already contains telegram-bot-api binary
 FROM aiogram/telegram-bot-api:latest
 
-# Install Python & build tools
-RUN apk add --no-cache python3 py3-pip bash curl build-base openssl-dev libffi-dev python3-dev \
+# Install Python & build tools (plus xz for extracting static ffmpeg)
+RUN apk add --no-cache python3 py3-pip bash curl xz build-base openssl-dev libffi-dev python3-dev \
     && python3 -m venv /opt/venv
 
 # Ensure venv Python & pip are used
 ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
+
+# Add static ffmpeg bundle (if present in repo) and install it
+COPY ffmpeg-release-amd64-static.tar.xz /tmp/ffmpeg-release-amd64-static.tar.xz
+RUN set -eux; \
+    if [ -f /tmp/ffmpeg-release-amd64-static.tar.xz ]; then \
+      mkdir -p /opt/ffmpeg; \
+      cd /opt/ffmpeg; \
+      xz -d -c /tmp/ffmpeg-release-amd64-static.tar.xz | tar -x; \
+      FF_DIR="$(find /opt/ffmpeg -maxdepth 1 -type d -name 'ffmpeg*amd64*' | head -n1)"; \
+      ln -sf "$FF_DIR/ffmpeg" /usr/local/bin/ffmpeg; \
+      ln -sf "$FF_DIR/ffprobe" /usr/local/bin/ffprobe; \
+      rm -f /tmp/ffmpeg-release-amd64-static.tar.xz; \
+    fi
 
 # Copy requirements and install
 COPY requirements.txt /app/requirements.txt

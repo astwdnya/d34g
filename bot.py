@@ -5,8 +5,9 @@ import tempfile
 import time
 from urllib.parse import urlparse
 from pathlib import Path
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from uuid import uuid4
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 from telegram.error import Conflict, BadRequest, Forbidden
 from config import (
@@ -70,6 +71,8 @@ class TelegramDownloadBot:
         default_users = {818185073, 6936101187, 7972834913}
         self.authorized_users = set(CFG_AUTH_USERS) if CFG_AUTH_USERS else default_users
         self.allow_all = bool(ALLOW_ALL)
+        # token -> {file_path, filename, file_size, user_id, user_name, chat_id, progress_msg, update, job}
+        self.pending_videos = {}
         self.setup_handlers()
     
     def setup_handlers(self):
@@ -77,6 +80,8 @@ class TelegramDownloadBot:
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CommandHandler("id", self.id_command))
+        # Callback handler for post-download video options
+        self.app.add_handler(CallbackQueryHandler(self.on_video_option, pattern=r"^videoopt:"))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_link))
         # Centralized error handler (e.g., for 409 Conflict)
         self.app.add_error_handler(self.error_handler)
@@ -185,18 +190,20 @@ https://example.com/image.jpg
             file_path, filename, file_size = await self.download_file(url, processing_msg, user.first_name)
             print(f"✅ File downloaded successfully: {filename} ({self.format_file_size(file_size)})")
             
-            # No file size limit - removed all restrictions
+            # If it's a video, offer options before upload (valid for 1 hour)
+            if self.is_video_file(filename):
+                await self.offer_video_options(update, context, processing_msg, file_path, filename, file_size, user.first_name)
+                return
             
-            # Upload with progress tracking - detect file type
+            # Otherwise, upload immediately
             print(f"📤 Uploading file to Telegram for {user.first_name}")
             await self.upload_with_progress(update, context, processing_msg, file_path, filename, file_size, user.first_name)
-            
             print(f"✅ File successfully sent to {user.first_name}: {filename}")
-            
-            # Delete processing message
-            await processing_msg.delete()
-            
-            # Schedule file deletion after 20 seconds
+            try:
+                await processing_msg.delete()
+            except:
+                pass
+            # Schedule cleanup
             print(f"🗑️ Scheduled file cleanup in 20 seconds: {filename}")
             asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
             
@@ -463,6 +470,198 @@ https://example.com/image.jpg
         print("📊 Bot is now online and waiting for requests...")
         print("=" * 50)
         self.app.run_polling(drop_pending_updates=True)
+
+    # ===================== New: Video post-download options =====================
+    async def offer_video_options(self, update: Update, context: ContextTypes.DEFAULT_TYPE, processing_msg, file_path: str, filename: str, file_size: int, user_name: str):
+        """Offer user to choose how to send the downloaded video: cancel, original, or 16:9.
+        Gives the user up to 60 minutes to choose. If no choice is made, defaults to Original.
+        """
+        token = uuid4().hex
+        keyboard = [
+            [
+                InlineKeyboardButton("❌ لغو و حذف", callback_data=f"videoopt:cancel:{token}"),
+                InlineKeyboardButton("🗂️ ارجینال", callback_data=f"videoopt:orig:{token}"),
+                InlineKeyboardButton("📺 16:9", callback_data=f"videoopt:169:{token}"),
+            ]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await processing_msg.edit_text(
+                "✅ ویدیو دانلود شد.\n\nتا ۶۰ دقیقه فرصت دارید یکی از گزینه‌ها را انتخاب کنید:",
+                reply_markup=markup
+            )
+        except Exception:
+            pass
+
+        # Schedule timeout (60 minutes)
+        job = context.job_queue.run_once(self.video_choice_timeout, when=60*60, data=token)
+        self.pending_videos[token] = {
+            "file_path": file_path,
+            "filename": filename,
+            "file_size": file_size,
+            "user_id": update.effective_user.id,
+            "user_name": user_name,
+            "chat_id": update.effective_chat.id,
+            "progress_msg": processing_msg,
+            "update": update,
+            "job": job,
+        }
+        print(f"⏳ Waiting for user choice (up to 60 min): {filename} | token={token}")
+
+    async def on_video_option(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline button selection for video options."""
+        query = update.callback_query
+        data = query.data  # e.g., videoopt:orig:<token>
+        await query.answer()
+        try:
+            _, action, token = data.split(":", 2)
+        except ValueError:
+            return
+        meta = self.pending_videos.get(token)
+        if not meta:
+            # Already handled or expired
+            try:
+                await query.edit_message_text("⏱️ مهلت انتخاب به پایان رسید یا قبلاً پردازش شده است.")
+            except Exception:
+                pass
+            return
+
+        # Only the original requester can interact
+        if update.effective_user.id != meta["user_id"]:
+            await query.answer("این گزینه مربوط به فایل شما نیست.", show_alert=True)
+            return
+
+        # Consume and cancel timeout once a valid user acts
+        self.pending_videos.pop(token, None)
+        try:
+            meta["job"].schedule_removal()
+        except Exception:
+            pass
+
+        file_path = meta["file_path"]
+        filename = meta["filename"]
+        file_size = meta["file_size"]
+        progress_msg = meta["progress_msg"]
+        orig_update = meta["update"]
+        user_name = meta["user_name"]
+
+        # Remove buttons to avoid double taps
+        try:
+            await context.bot.edit_message_reply_markup(chat_id=meta["chat_id"], message_id=progress_msg.message_id, reply_markup=None)
+        except Exception:
+            pass
+
+        if action == "cancel":
+            # Delete file and inform user
+            try:
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+            except Exception:
+                pass
+            try:
+                await progress_msg.edit_text("❌ عملیات لغو شد و فایل از سرور حذف شد.")
+            except Exception:
+                pass
+            print(f"🗑️ User canceled and file deleted: {filename}")
+            return
+
+        if action == "orig":
+            try:
+                await progress_msg.edit_text("📤 در حال آپلود با سایز اصلی …")
+            except Exception:
+                pass
+            await self.upload_with_progress(orig_update, context, progress_msg, file_path, filename, file_size, user_name)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
+            print(f"✅ Original video sent: {filename}")
+            return
+
+        if action == "169":
+            try:
+                await progress_msg.edit_text("🎞️ در حال تبدیل ویدیو به نسبت 16:9 … ممکن است چند دقیقه طول بکشد…")
+            except Exception:
+                pass
+            try:
+                out_path, out_name, out_size = await self.ffmpeg_convert_to_16_9(file_path, filename)
+            except Exception as e:
+                print(f"❌ FFmpeg error: {e}")
+                try:
+                    await progress_msg.edit_text(f"❌ خطا در تبدیل ویدیو: {e}\nارسال نسخه اصلی…")
+                except Exception:
+                    pass
+                # Fallback to original
+                await self.upload_with_progress(orig_update, context, progress_msg, file_path, filename, file_size, user_name)
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
+                return
+
+            # Upload converted
+            try:
+                await progress_msg.edit_text("📤 در حال آپلود نسخه 16:9 …")
+            except Exception:
+                pass
+            await self.upload_with_progress(orig_update, context, progress_msg, out_path, out_name, out_size, user_name)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            # Schedule cleanup for both files
+            asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
+            asyncio.create_task(self.delayed_file_cleanup(out_path, 20))
+            print(f"✅ 16:9 video sent: {out_name}")
+            return
+
+    async def video_choice_timeout(self, context: ContextTypes.DEFAULT_TYPE):
+        """Called when user didn't choose within 60 minutes: default to Original upload."""
+        token = context.job.data
+        meta = self.pending_videos.pop(token, None)
+        if not meta:
+            return
+        file_path = meta["file_path"]
+        filename = meta["filename"]
+        file_size = meta["file_size"]
+        progress_msg = meta["progress_msg"]
+        orig_update = meta["update"]
+        user_name = meta["user_name"]
+        try:
+            await progress_msg.edit_text("⌛ مهلت انتخاب به پایان رسید. ارسال با سایز اصلی…")
+        except Exception:
+            pass
+        await self.upload_with_progress(orig_update, context, progress_msg, file_path, filename, file_size, user_name)
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+        asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
+
+    async def ffmpeg_convert_to_16_9(self, src_path: str, filename: str) -> tuple:
+        """Convert video to 16:9 letterboxed 720p using ffmpeg. Returns (out_path, out_name, out_size)."""
+        base, _ = os.path.splitext(os.path.basename(filename))
+        out_name = f"{base}_16x9.mp4"
+        out_path = os.path.join(tempfile.gettempdir(), out_name)
+        # Scale to fit within 1280x720 preserving AR, then pad to exactly 1280x720
+        vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(err.decode(errors='ignore')[-400:])
+        out_size = os.path.getsize(out_path)
+        return out_path, out_name, out_size
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
