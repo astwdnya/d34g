@@ -3,8 +3,6 @@ import asyncio
 import aiohttp
 import tempfile
 import time
-import json
-from fractions import Fraction
 from urllib.parse import urlparse
 from pathlib import Path
 from uuid import uuid4
@@ -609,11 +607,7 @@ https://example.com/image.jpg
 
             # Upload converted
             try:
-                if out_path == file_path:
-                    # Already 16:9 or lossless change not possible without re-encode
-                    await progress_msg.edit_text("ℹ️ ویدیو از قبل 16:9 بوده یا تبدیل بدون افت کیفیت ممکن نبوده؛ ارسال همین نسخه…")
-                else:
-                    await progress_msg.edit_text("📤 در حال آپلود نسخه 16:9 …")
+                await progress_msg.edit_text("📤 در حال آپلود نسخه 16:9 …")
             except Exception:
                 pass
             await self.upload_with_progress(orig_update, context, progress_msg, out_path, out_name, out_size, user_name)
@@ -651,85 +645,27 @@ https://example.com/image.jpg
         asyncio.create_task(self.delayed_file_cleanup(file_path, 20))
 
     async def ffmpeg_convert_to_16_9(self, src_path: str, filename: str) -> tuple:
-        """Make video 16:9 WITHOUT changing resolution when possible.
-        Preferred path: keep original streams (no re-encode), adjust SAR via bitstream filter (h264/hevc).
-        Fallback: minimal re-encode with setsar/setdar while keeping original resolution.
-        Returns (out_path, out_name, out_size).
-        """
-        async def ffprobe_info(path: str):
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,codec_name,sample_aspect_ratio",
-                "-of", "json",
-                path,
-            ]
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            out, _ = await proc.communicate()
-            data = json.loads(out.decode() or "{}")
-            streams = data.get("streams", [])
-            return streams[0] if streams else {}
-
-        info = await ffprobe_info(src_path)
-        width = int(info.get("width") or 0)
-        height = int(info.get("height") or 0)
-        codec = (info.get("codec_name") or "").lower()
-        sar_str = info.get("sample_aspect_ratio") or "1:1"
-        try:
-            sar_num, sar_den = sar_str.split(":")
-            sar = float(int(sar_num)) / (int(sar_den) if int(sar_den) != 0 else 1)
-        except Exception:
-            sar = 1.0
-
-        # Current display aspect ratio (DAR)
-        dar_current = (width * sar) / height if width and height else 0
-        dar_target = 16 / 9
-
-        base, ext = os.path.splitext(os.path.basename(filename))
-        out_name = f"{base}_16x9{ext or '.mp4'}"
+        """Convert video to 16:9 720p by STRETCHING (no black bars). Returns (out_path, out_name, out_size)."""
+        base, _ = os.path.splitext(os.path.basename(filename))
+        out_name = f"{base}_16x9.mp4"
         out_path = os.path.join(tempfile.gettempdir(), out_name)
-
-        # If already ~16:9, just copy
-        if dar_current and abs(dar_current - dar_target) < 0.02:
-            # No change needed
-            return src_path, filename, os.path.getsize(src_path)
-
-        # Calculate SAR to achieve 16:9 without scaling: DAR = W*SAR/H => SAR=16*H/(9*W)
-        if width and height:
-            target_sar = (16 * height) / (9 * width)
-        else:
-            target_sar = 1.0
-        frac = Fraction(target_sar).limit_denominator(1000)
-        sar_num, sar_den = frac.numerator, frac.denominator
-
-        # Try stream-copy with bitstream filter for H.264/HEVC first
-        bsf = None
-        if codec in ("h264", "avc1"):
-            bsf = f"h264_metadata=sample_aspect_ratio={sar_num}/{sar_den}"
-        elif codec in ("hevc", "h265"):
-            bsf = f"hevc_metadata=sample_aspect_ratio={sar_num}/{sar_den}"
-
-        if bsf:
-            cmd_copy = [
-                "ffmpeg", "-y", "-i", src_path,
-                "-map", "0",
-                "-c", "copy",
-                "-bsf:v", bsf,
-                out_path,
-            ]
-            proc = await asyncio.create_subprocess_exec(*cmd_copy, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            _, err = await proc.communicate()
-            if proc.returncode == 0 and os.path.exists(out_path):
-                out_size = os.path.getsize(out_path)
-                return out_path, out_name, out_size
-            else:
-                # Log and fallback
-                try:
-                    print(f"⚠️ Stream-copy DAR adjust failed, will keep original: {err.decode(errors='ignore')[-200:]}")
-                except Exception:
-                    pass
-        # If we reach here, we can't losslessly adjust to 16:9. Return original.
-        return src_path, filename, os.path.getsize(src_path)
+        # Stretch to exactly 1280x720 (no letterbox), set square pixels
+        vf = "scale=1280:720,setsar=1"
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(err.decode(errors='ignore')[-400:])
+        out_size = os.path.getsize(out_path)
+        return out_path, out_name, out_size
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
