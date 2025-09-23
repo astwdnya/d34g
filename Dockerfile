@@ -11,25 +11,25 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Add static ffmpeg bundle (if present in repo) and install it
-COPY ffmpeg-release-amd64-static.tar.xz /tmp/ffmpeg-release-amd64-static.tar.xz
-RUN set -eux; \
-    if [ -f /tmp/ffmpeg-release-amd64-static.tar.xz ]; then \
-      mkdir -p /opt/ffmpeg; \
-      cd /opt/ffmpeg; \
-      xz -d -c /tmp/ffmpeg-release-amd64-static.tar.xz | tar -x; \
-      FF_DIR="$(find /opt/ffmpeg -maxdepth 1 -type d -name 'ffmpeg*amd64*' | head -n1)"; \
-      ln -sf "$FF_DIR/ffmpeg" /usr/local/bin/ffmpeg; \
-      ln -sf "$FF_DIR/ffprobe" /usr/local/bin/ffprobe; \
-      rm -f /tmp/ffmpeg-release-amd64-static.tar.xz; \
-    fi
-
 # Copy requirements and install
 COPY requirements.txt /app/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy app code
 COPY . /app
+
+# Install ffmpeg: prefer bundled static archive if present, otherwise install via apk
+RUN set -eux; \
+    if [ -f /app/ffmpeg-release-amd64-static.tar.xz ]; then \
+      mkdir -p /opt/ffmpeg; \
+      cd /opt/ffmpeg; \
+      xz -d -c /app/ffmpeg-release-amd64-static.tar.xz | tar -x; \
+      FF_DIR="$(find /opt/ffmpeg -maxdepth 1 -type d -name 'ffmpeg*amd64*' | head -n1)"; \
+      ln -sf "$FF_DIR/ffmpeg" /usr/local/bin/ffmpeg; \
+      ln -sf "$FF_DIR/ffprobe" /usr/local/bin/ffprobe; \
+    else \
+      apk add --no-cache ffmpeg; \
+    fi
 
 # Default environment
 ENV PYTHONUNBUFFERED=1 \
