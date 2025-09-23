@@ -248,9 +248,9 @@ https://example.com/image.jpg
                         file.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Update progress every 2 seconds
+                        # Update progress every 0.5 seconds
                         current_time = time.time()
-                        if current_time - last_update >= 2 and progress_msg and total_size > 0:
+                        if current_time - last_update >= 0.5 and progress_msg and total_size > 0:
                             elapsed_time = current_time - start_time
                             speed = downloaded / elapsed_time if elapsed_time > 0 else 0
                             percentage = (downloaded / total_size) * 100
@@ -493,8 +493,12 @@ https://example.com/image.jpg
         except Exception:
             pass
 
-        # Schedule timeout (60 minutes)
-        job = context.job_queue.run_once(self.video_choice_timeout, when=60*60, data=token)
+        # Schedule timeout (60 minutes) if JobQueue is available
+        job = None
+        if getattr(context, "job_queue", None):
+            job = context.job_queue.run_once(self.video_choice_timeout, when=60*60, data=token)
+        else:
+            print("⚠️ JobQueue not available. Install python-telegram-bot[job-queue] to enable auto-timeout. Buttons will stay active without timeout.")
         self.pending_videos[token] = {
             "file_path": file_path,
             "filename": filename,
