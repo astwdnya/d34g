@@ -1,6 +1,8 @@
 import os
+import re
 import asyncio
 import aiohttp
+import mimetypes
 import tempfile
 import time
 from urllib.parse import urlparse
@@ -73,6 +75,8 @@ class TelegramDownloadBot:
         self.allow_all = bool(ALLOW_ALL)
         # token -> {file_path, filename, file_size, user_id, user_name, chat_id, progress_msg, update, job}
         self.pending_videos = {}
+        # token -> {url, user_id, user_name, chat_id, progress_msg, update, job}
+        self.pending_ytdl = {}
         self.setup_handlers()
     
     def setup_handlers(self):
@@ -82,6 +86,8 @@ class TelegramDownloadBot:
         self.app.add_handler(CommandHandler("id", self.id_command))
         # Callback handler for post-download video options
         self.app.add_handler(CallbackQueryHandler(self.on_video_option, pattern=r"^videoopt:"))
+        # Callback handler for YouTube quality selection
+        self.app.add_handler(CallbackQueryHandler(self.on_ytdl_option, pattern=r"^ytdl:"))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_link))
         # Centralized error handler (e.g., for 409 Conflict)
         self.app.add_error_handler(self.error_handler)
@@ -185,6 +191,10 @@ https://example.com/image.jpg
         processing_msg = await update.message.reply_text("⏳ در حال دانلود فایل...")
         
         try:
+            # If it's a YouTube link, offer quality options first
+            if self.is_youtube_url(url):
+                await self.offer_ytdl_options(update, context, processing_msg, url, user.first_name)
+                return
             # Download the file with progress
             print(f"📥 Downloading file from: {url}")
             file_path, filename, file_size = await self.download_file(url, processing_msg, user.first_name)
@@ -224,15 +234,35 @@ https://example.com/image.jpg
         # Configure session with no size limits
         timeout = aiohttp.ClientTimeout(total=None, connect=30)
         connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+        # Browser-like headers help some CDNs (e.g., mediafire) serve the real file instead of an HTML page
+        parsed = urlparse(url)
+        referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
+            "Connection": "keep-alive",
+        }
+        if referer:
+            headers["Referer"] = referer
         
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
             async with session.get(url, allow_redirects=True) as response:
                 if response.status != 200:
                     raise Exception(f"HTTP {response.status}: نمی‌توان فایل را دانلود کرد")
                 
                 # Get filename and total size
                 filename = self.get_filename_from_response(response, url)
-                total_size = int(response.headers.get('content-length', 0))
+                total_size = int(response.headers.get('content-length', 0) or 0)
+                content_type = (response.headers.get('content-type') or '').lower()
+                is_video_ext = self.is_video_file(filename)
+                is_binary_ct = any(x in content_type for x in ["video/", "audio/", "image/", "application/octet-stream"]) if content_type else False
+                # If server indicates HTML/text and it's supposed to be a video, abort early
+                if is_video_ext and content_type and ("text/html" in content_type or "text/plain" in content_type):
+                    raise Exception("این لینک مستقیم فایل نیست یا به صفحه هدایت می‌شود. لطفاً لینک دانلود مستقیم را ارسال کنید.")
+                # If declared total size is suspiciously small for a video, abort early
+                if is_video_ext and total_size and total_size < 200 * 1024:  # < 200KB
+                    raise Exception("حجم اعلام‌شده بسیار کم است. لینک مستقیم ویدیو معتبر نیست.")
                 
                 # Create temporary file
                 temp_dir = tempfile.gettempdir()
@@ -266,6 +296,13 @@ https://example.com/image.jpg
                             except:
                                 pass  # Ignore edit errors
                 
+                # Final sanity check: if extension says video but downloaded size is too small, treat as invalid
+                if is_video_ext and downloaded < 200 * 1024:
+                    try:
+                        os.unlink(file_path)
+                    except Exception:
+                        pass
+                    raise Exception("فایل دریافتی ویدیو نیست یا ناقص است (حجم بسیار کم). احتمالاً لینک مستقیم نیست.")
                 return file_path, filename, downloaded
     
     def get_filename_from_response(self, response, url: str) -> str:
@@ -280,7 +317,8 @@ https://example.com/image.jpg
         
         # Extract filename from URL
         parsed_url = urlparse(url)
-        filename = os.path.basename(parsed_url.path)
+        from urllib.parse import unquote
+        filename = unquote(os.path.basename(parsed_url.path))
         
         # If no filename found, use a default name
         if not filename or '.' not in filename:
@@ -666,6 +704,214 @@ https://example.com/image.jpg
             raise RuntimeError(err.decode(errors='ignore')[-400:])
         out_size = os.path.getsize(out_path)
         return out_path, out_name, out_size
+
+    # ===================== New: YouTube handling with yt-dlp =====================
+    def is_youtube_url(self, url: str) -> bool:
+        """Return True if URL is a YouTube link (youtube.com or youtu.be)."""
+        try:
+            u = url.lower()
+            return bool(re.search(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", u))
+        except Exception:
+            return False
+
+    async def offer_ytdl_options(self, update: Update, context: ContextTypes.DEFAULT_TYPE, processing_msg, url: str, user_name: str):
+        """Extract available YouTube qualities and present as inline buttons."""
+        try:
+            heights = await self.ytdl_list_heights(url)
+        except Exception as e:
+            print(f"❌ yt-dlp extract error: {e}")
+            await processing_msg.edit_text("❌ خطا در واکشی کیفیت‌های یوتیوب. لطفاً لینک را بررسی کنید یا بعداً دوباره تلاش کنید.")
+            return
+
+        if not heights:
+            await processing_msg.edit_text("⚠️ کیفیتی یافت نشد. ارسال نسخه‌ی پیش‌فرض …")
+            # Fall back to default best
+            await self.on_ytdl_download_and_send(update, context, processing_msg, url, None)
+            return
+
+        # Keep common set and sort descending (e.g., 1080, 720, 480, ...)
+        heights = sorted(set(heights), reverse=True)
+        # Limit to top 6 options
+        heights = heights[:6]
+        token = uuid4().hex
+        rows = []
+        row = []
+        for h in heights:
+            label = f"{h}p"
+            row.append(InlineKeyboardButton(label, callback_data=f"ytdl:{h}:{token}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        # Extra buttons: cancel and best
+        rows.append([
+            InlineKeyboardButton("❌ لغو", callback_data=f"ytdl:cancel:{token}"),
+            InlineKeyboardButton("⭐ بهترین", callback_data=f"ytdl:best:{token}"),
+        ])
+        markup = InlineKeyboardMarkup(rows)
+        try:
+            await processing_msg.edit_text("🎬 لینک یوتیوب شناسایی شد. یکی از کیفیت‌ها را انتخاب کنید:", reply_markup=markup)
+        except Exception:
+            pass
+
+        job = None
+        if getattr(context, "job_queue", None):
+            job = context.job_queue.run_once(self.ytdl_choice_timeout, when=60*60, data=token)
+        self.pending_ytdl[token] = {
+            "url": url,
+            "user_id": update.effective_user.id,
+            "user_name": user_name,
+            "chat_id": update.effective_chat.id,
+            "progress_msg": processing_msg,
+            "update": update,
+            "job": job,
+        }
+
+    async def on_ytdl_option(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        try:
+            _, qual, token = query.data.split(":", 2)
+        except ValueError:
+            return
+        meta = self.pending_ytdl.get(token)
+        if not meta:
+            try:
+                await query.edit_message_text("⏱️ مهلت انتخاب به پایان رسیده یا قبلاً پردازش شده است.")
+            except Exception:
+                pass
+            return
+        if update.effective_user.id != meta["user_id"]:
+            await query.answer("این گزینه مربوط به شما نیست.", show_alert=True)
+            return
+        # consume
+        self.pending_ytdl.pop(token, None)
+        try:
+            if meta.get("job"):
+                meta["job"].schedule_removal()
+        except Exception:
+            pass
+        # Remove buttons
+        try:
+            await context.bot.edit_message_reply_markup(chat_id=meta["chat_id"], message_id=meta["progress_msg"].message_id, reply_markup=None)
+        except Exception:
+            pass
+        if qual == "cancel":
+            try:
+                await meta["progress_msg"].edit_text("❌ لغو شد.")
+            except Exception:
+                pass
+            return
+        height = None if qual == "best" else int(qual)
+        await self.on_ytdl_download_and_send(meta["update"], context, meta["progress_msg"], meta["url"], height)
+
+    async def ytdl_choice_timeout(self, context: ContextTypes.DEFAULT_TYPE):
+        token = context.job.data
+        meta = self.pending_ytdl.pop(token, None)
+        if not meta:
+            return
+        try:
+            await meta["progress_msg"].edit_text("⌛ مهلت انتخاب تمام شد. دانلود بهترین کیفیت…")
+        except Exception:
+            pass
+        await self.on_ytdl_download_and_send(meta["update"], context, meta["progress_msg"], meta["url"], None)
+
+    async def ytdl_list_heights(self, url: str) -> list:
+        """Return available video heights (e.g., [144, 240, 360, 480, 720, 1080])."""
+        def extract():
+            import yt_dlp
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                heights = []
+                for f in info.get('formats', []) if isinstance(info, dict) else []:
+                    h = f.get('height')
+                    if h and f.get('vcodec') != 'none':
+                        heights.append(int(h))
+                return heights
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, extract)
+
+    async def on_ytdl_download_and_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE, progress_msg, url: str, height: int | None):
+        """Download YouTube video with selected quality and send to user."""
+        try:
+            if height:
+                try:
+                    await progress_msg.edit_text(f"⏬ در حال دانلود کیفیت {height}p …")
+                except Exception:
+                    pass
+            else:
+                try:
+                    await progress_msg.edit_text("⏬ در حال دانلود بهترین کیفیت …")
+                except Exception:
+                    pass
+
+            token = uuid4().hex
+            temp_dir = tempfile.gettempdir()
+            prefix = os.path.join(temp_dir, f"ytdl_{token}")
+
+            def download():
+                import yt_dlp
+                fmt = 'best'
+                if height:
+                    # Prefer MP4/M4A when possible; fall back gracefully using <= height
+                    fmt = (
+                        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                        f"bestvideo[height<={height}]+bestaudio/"
+                        f"best[height<={height}]"
+                    )
+                ydl_opts = {
+                    'format': fmt,
+                    'merge_output_format': 'mp4',
+                    'outtmpl': prefix + '.%(ext)s',
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    # Determine output path
+                    # yt-dlp will replace %(ext)s with actual extension
+                    # Try to compute final path
+                    ext = (info.get('ext') or 'mp4') if isinstance(info, dict) else 'mp4'
+                    out_path = prefix + '.' + ext
+                    # Sometimes extension may differ; attempt glob
+                    if not os.path.exists(out_path):
+                        import glob
+                        matches = glob.glob(prefix + '.*')
+                        if matches:
+                            out_path = matches[0]
+                    size = os.path.getsize(out_path)
+                    name = os.path.basename(out_path)
+                    return out_path, name, size
+
+            loop = asyncio.get_running_loop()
+            out_path, out_name, out_size = await loop.run_in_executor(None, download)
+
+            # Upload
+            caption = f"✅ ویدیو دانلود شد (YouTube)\n📁 {out_name}\n🎞️ کیفیت: {height or 'best'}\n📊 {self.format_file_size(out_size)}"
+            try:
+                await progress_msg.edit_text("📤 در حال آپلود …")
+            except Exception:
+                pass
+            # Build a pseudo-update object for upload_with_progress
+            await self.upload_with_progress(update, context, progress_msg, out_path, out_name, out_size, update.effective_user.first_name)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            # Cleanup
+            asyncio.create_task(self.delayed_file_cleanup(out_path, 20))
+        except Exception as e:
+            print(f"❌ yt-dlp download error: {e}")
+            try:
+                await progress_msg.edit_text(f"❌ خطا در دانلود از یوتیوب: {e}")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     bot = TelegramDownloadBot()
