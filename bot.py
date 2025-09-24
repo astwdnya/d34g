@@ -6,6 +6,7 @@ import mimetypes
 import tempfile
 import time
 import base64
+import json
 from urllib.parse import urlparse
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +24,8 @@ from config import (
     ALLOW_ALL,
     YT_COOKIES_FILE,
     YT_COOKIES_B64,
+    INVIDIOUS_INSTANCES,
+    PIPED_INSTANCES,
 )
 try:
     from uploader import upload_to_bridge
@@ -105,6 +108,8 @@ class TelegramDownloadBot:
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CommandHandler("id", self.id_command))
+        # Admin utility to set YouTube cookies (base64) at runtime
+        self.app.add_handler(CommandHandler("setycb64", self.set_yt_cookies_b64))
         # Callback handler for post-download video options
         self.app.add_handler(CallbackQueryHandler(self.on_video_option, pattern=r"^videoopt:"))
         # Callback handler for YouTube quality selection
@@ -212,9 +217,10 @@ https://example.com/image.jpg
         processing_msg = await update.message.reply_text("⏳ در حال دانلود فایل...")
         
         try:
-            # If it's a YouTube link, offer quality options first
+            # If it's a YouTube link, normalize and offer quality options first
             if self.is_youtube_url(url):
-                await self.offer_ytdl_options(update, context, processing_msg, url, user.first_name)
+                url_norm = self.normalize_youtube_url(url)
+                await self.offer_ytdl_options(update, context, processing_msg, url_norm, user.first_name)
                 return
             # Download the file with progress
             print(f"📥 Downloading file from: {url}")
@@ -735,17 +741,142 @@ https://example.com/image.jpg
         except Exception:
             return False
 
+    def normalize_youtube_url(self, url: str) -> str:
+        """Normalize YouTube URLs (shorts, youtu.be) to standard watch?v=ID"""
+        try:
+            u = url.strip()
+            # youtu.be/<id>
+            m = re.search(r"youtu\.be/([\w-]{11})", u)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # youtube.com/shorts/<id>
+            m = re.search(r"youtube\.com/shorts/([\w-]{11})", u)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # youtube.com/watch?v=<id>
+            m = re.search(r"v=([\w-]{11})", u)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            return url
+        except Exception:
+            return url
+
+    async def set_yt_cookies_b64(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command: /setycb64 <base64 of cookies.txt>. Writes cookies to temp and enables yt-dlp auth.
+        Only authorized users can use this.
+        """
+        user = update.effective_user
+        if not self.is_authorized_user(user.id):
+            return
+        if not context.args:
+            await update.message.reply_text(
+                "لطفاً مقدار base64 کوکی‌های یوتیوب را بعد از دستور بفرستید.\n"
+                "نمونه: /setycb64 AAAABBBB...\n"
+                "راهنما: از افزونه Get cookies.txt کوکی‌های youtube.com را استخراج کنید و با PowerShell دستور زیر را اجرا کنید:\n"
+                "[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\path\\cookies.txt'))"
+            )
+            return
+        b64 = " ".join(context.args)
+        try:
+            data = base64.b64decode(b64)
+            path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            with open(path, "wb") as f:
+                f.write(data)
+            self.yt_cookies_path = path
+            await update.message.reply_text("✅ کوکی‌های یوتیوب با موفقیت تنظیم شد.")
+            print("🍪 YouTube cookies set via /setycb64")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در تنظیم کوکی‌ها: {e}")
+
     async def offer_ytdl_options(self, update: Update, context: ContextTypes.DEFAULT_TYPE, processing_msg, url: str, user_name: str):
         """Extract available YouTube qualities and present as inline buttons."""
+        # 1) Prefer Invidious (no-cookie) progressive streams (like public downloader sites)
+        inv_map, inv_title = await self.yt_inv_fetch_heights_map(url)
+        if inv_map:
+            heights = sorted(inv_map.keys(), reverse=True)[:6]
+            token = uuid4().hex
+            rows, row = [], []
+            for h in heights:
+                row.append(InlineKeyboardButton(f"{h}p", callback_data=f"ytdl:{h}:{token}"))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            rows.append([
+                InlineKeyboardButton("❌ لغو", callback_data=f"ytdl:cancel:{token}"),
+                InlineKeyboardButton("⭐ بهترین", callback_data=f"ytdl:best:{token}"),
+            ])
+            markup = InlineKeyboardMarkup(rows)
+            try:
+                await processing_msg.edit_text("🎬 لینک یوتیوب شناسایی شد. یکی از کیفیت‌ها را انتخاب کنید:", reply_markup=markup)
+            except Exception:
+                pass
+            job = None
+            if getattr(context, "job_queue", None):
+                job = context.job_queue.run_once(self.ytdl_choice_timeout, when=60*60, data=token)
+            self.pending_ytdl[token] = {
+                "url": url,
+                "user_id": update.effective_user.id,
+                "user_name": user_name,
+                "chat_id": update.effective_chat.id,
+                "progress_msg": processing_msg,
+                "update": update,
+                "job": job,
+                "agg_map": inv_map,  # height -> direct url
+                "agg_title": inv_title,
+            }
+            return
+
+        # 1.5) Fallback to Piped API (separate MP4 video + M4A audio; we'll merge)
+        piped_map, piped_title = await self.yt_piped_fetch_quality_map(url)
+        if piped_map:
+            heights = sorted(piped_map.keys(), reverse=True)[:6]
+            token = uuid4().hex
+            rows, row = [], []
+            for h in heights:
+                row.append(InlineKeyboardButton(f"{h}p", callback_data=f"ytdl:{h}:{token}"))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            rows.append([
+                InlineKeyboardButton("❌ لغو", callback_data=f"ytdl:cancel:{token}"),
+                InlineKeyboardButton("⭐ بهترین", callback_data=f"ytdl:best:{token}"),
+            ])
+            markup = InlineKeyboardMarkup(rows)
+            try:
+                await processing_msg.edit_text("🎬 لینک یوتیوب شناسایی شد. یکی از کیفیت‌ها را انتخاب کنید:", reply_markup=markup)
+            except Exception:
+                pass
+            job = None
+            if getattr(context, "job_queue", None):
+                job = context.job_queue.run_once(self.ytdl_choice_timeout, when=60*60, data=token)
+            self.pending_ytdl[token] = {
+                "url": url,
+                "user_id": update.effective_user.id,
+                "user_name": user_name,
+                "chat_id": update.effective_chat.id,
+                "progress_msg": processing_msg,
+                "update": update,
+                "job": job,
+                "agg_map": piped_map,  # height -> {vurl, aurl}
+                "agg_title": piped_title,
+                "agg_type": "piped_v+a",
+            }
+            return
+
+        # 2) Fallback to yt-dlp (may require cookies depending on YouTube safeguards)
         try:
             heights = await self.ytdl_list_heights(url)
         except Exception as e:
             print(f"❌ yt-dlp extract error: {e}")
             msg = "❌ خطا در واکشی کیفیت‌های یوتیوب."
             if "Sign in to confirm" in str(e):
-                msg += "\nبرای بعضی لینک‌ها نیاز به کوکی یوتیوب هست. متغیرهای YT_COOKIES_FILE یا YT_COOKIES_B64 را تنظیم کنید."
-            msg += "\nلطفاً لینک را بررسی کنید یا بعداً دوباره تلاش کنید."
-            await processing_msg.edit_text(msg + "\nتلاش برای دانلود بهترین کیفیت …")
+                msg += "\nاین لینک به کوکی نیاز دارد. می‌توانید از دستور /setycb64 برای ست‌کردن کوکی استفاده کنید."
+            msg += "\nتلاش برای دانلود بهترین کیفیت …"
+            await processing_msg.edit_text(msg)
             await self.on_ytdl_download_and_send(update, context, processing_msg, url, None)
             return
 
@@ -829,6 +960,25 @@ https://example.com/image.jpg
             except Exception:
                 pass
             return
+        # If we have aggregator map (Invidious), download direct URL (no cookies)
+        if meta.get("agg_map"):
+            if qual == "best":
+                height = max(meta["agg_map"].keys())
+            else:
+                height = int(qual)
+            title = meta.get("agg_title") or "youtube_video"
+            if meta.get("agg_type") == "piped_v+a":
+                entry = meta["agg_map"].get(height)
+                if not entry:
+                    await meta["progress_msg"].edit_text("❌ کیفیت انتخاب‌شده در دسترس نیست.")
+                    return
+                await self.download_piped_and_send(meta["update"], context, meta["progress_msg"], entry["vurl"], entry["aurl"], title, height)
+                return
+            else:
+                direct_url = meta["agg_map"].get(height)
+                await self.download_direct_and_send(meta["update"], context, meta["progress_msg"], direct_url, title, height)
+                return
+        # Otherwise use yt-dlp flow
         height = None if qual == "best" else int(qual)
         await self.on_ytdl_download_and_send(meta["update"], context, meta["progress_msg"], meta["url"], height)
 
@@ -879,6 +1029,171 @@ https://example.com/image.jpg
                 return heights
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, extract)
+
+    async def yt_inv_fetch_heights_map(self, url: str) -> tuple[dict, str | None]:
+        """Try Invidious API to get progressive MP4 streams without cookies.
+        Returns (heights_map, title). heights_map: {height:int -> direct_url:str}
+        """
+        vid = self.extract_youtube_id(url)
+        if not vid:
+            return {}, None
+
+    async def yt_piped_fetch_quality_map(self, url: str) -> tuple[dict, str | None]:
+        """Use Piped API to get MP4 video-only URLs and M4A audio URL; return map height->{vurl,aurl}."""
+        vid = self.extract_youtube_id(url)
+        if not vid:
+            return {}, None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36",
+            "Accept": "application/json",
+        }
+        for base in PIPED_INSTANCES:
+            api = base.rstrip('/') + f"/api/v1/streams/{vid}"
+            try:
+                async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as s:
+                    async with s.get(api) as r:
+                        if r.status != 200:
+                            continue
+                        data = await r.json(content_type=None)
+                        title = data.get("title") if isinstance(data, dict) else None
+                        videos = data.get("videoStreams") or []
+                        audios = data.get("audioStreams") or []
+                        # pick best M4A audio
+                        a_best = None
+                        best_ab = -1
+                        for a in audios:
+                            mime = (a.get("mimeType") or a.get("type") or "").lower()
+                            if "audio/mp4" in mime or ".m4a" in (a.get("url") or ""):
+                                br = int(a.get("bitrate") or 0)
+                                if br > best_ab:
+                                    best_ab = br
+                                    a_best = a.get("url")
+                        heights = {}
+                        if a_best:
+                            for v in videos:
+                                mime = (v.get("mimeType") or v.get("type") or "").lower()
+                                codec = (v.get("codec") or "").lower()
+                                q = v.get("quality") or v.get("qualityLabel") or ""
+                                m = re.search(r"(\d{3,4})p", str(q))
+                                if not m:
+                                    continue
+                                if "video/mp4" not in mime and "mp4" not in (v.get("container") or "").lower():
+                                    continue
+                                if "avc" not in codec and "h264" not in codec:
+                                    continue
+                                h = int(m.group(1))
+                                heights[h] = {"vurl": v.get("url"), "aurl": a_best}
+                        if heights:
+                            return heights, title
+            except Exception:
+                continue
+        return {}, None
+
+    async def download_piped_and_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE, progress_msg, vurl: str, aurl: str, title: str, height: int | None):
+        """Download separate MP4 video + M4A audio URLs and mux into MP4 using ffmpeg (copy)."""
+        safe_title = re.sub(r"[^\w\-\.\u0600-\u06FF ]+", "_", title).strip() or "youtube_video"
+        out_name = f"{safe_title}_{height or 'best'}p.mp4"
+        out_path = os.path.join(tempfile.gettempdir(), out_name)
+        try:
+            try:
+                await progress_msg.edit_text("⏬ در حال دانلود و ادغام (Piped) …")
+            except Exception:
+                pass
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", vurl,
+                "-i", aurl,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                out_path,
+            ]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors='ignore')[-400:])
+            size = os.path.getsize(out_path)
+            try:
+                await progress_msg.edit_text("📤 در حال آپلود …")
+            except Exception:
+                pass
+            await self.upload_with_progress(update, context, progress_msg, out_path, out_name, size, update.effective_user.first_name)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            asyncio.create_task(self.delayed_file_cleanup(out_path, 20))
+        except Exception as e:
+            print(f"❌ piped download error: {e}")
+            try:
+                await progress_msg.edit_text(f"❌ خطا در دانلود از Piped: {e}\nتلاش برای بهترین کیفیت با yt-dlp …")
+            except Exception:
+                pass
+            await self.on_ytdl_download_and_send(update, context, progress_msg, self.normalize_youtube_url(update.message.text.strip()), None)
+
+    def extract_youtube_id(self, url: str) -> str | None:
+        try:
+            u = self.normalize_youtube_url(url)
+            m = re.search(r"v=([\w-]{11})", u)
+            if m:
+                return m.group(1)
+            m = re.search(r"youtu\.be/([\w-]{11})", u)
+            if m:
+                return m.group(1)
+            return None
+        except Exception:
+            return None
+
+    async def download_direct_and_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE, progress_msg, direct_url: str, title: str, height: int | None):
+        """Download a direct video URL (e.g., from Invidious) and send to user."""
+        # Compose a safe filename ending with .mp4
+        safe_title = re.sub(r"[^\w\-\.\u0600-\u06FF ]+", "_", title).strip() or "youtube_video"
+        if height:
+            out_name = f"{safe_title}_{height}p.mp4"
+        else:
+            out_name = f"{safe_title}.mp4"
+        # Stream download
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://www.youtube.com/",
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(direct_url, allow_redirects=True) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}: دریافت ویدیو ممکن نیست")
+                temp_dir = tempfile.gettempdir()
+                out_path = os.path.join(temp_dir, out_name)
+                downloaded = 0
+                total_size = int(response.headers.get('content-length', 0) or 0)
+                start_time = time.time()
+                last_update = 0
+                with open(out_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        current_time = time.time()
+                        if current_time - last_update >= 2 and progress_msg and total_size > 0:
+                            elapsed_time = current_time - start_time
+                            speed = downloaded / elapsed_time if elapsed_time > 0 else 0
+                            percentage = (downloaded / total_size) * 100
+                            progress_text = self.create_progress_text("📥 دانلود", percentage, speed, downloaded, total_size)
+                            try:
+                                await progress_msg.edit_text(progress_text)
+                                last_update = current_time
+                            except Exception:
+                                pass
+        size = os.path.getsize(out_path)
+        try:
+            await progress_msg.edit_text("📤 در حال آپلود …")
+        except Exception:
+            pass
+        await self.upload_with_progress(update, context, progress_msg, out_path, out_name, size, update.effective_user.first_name)
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+        asyncio.create_task(self.delayed_file_cleanup(out_path, 20))
 
     async def on_ytdl_download_and_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE, progress_msg, url: str, height: int | None):
         """Download YouTube video with selected quality and send to user."""

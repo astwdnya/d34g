@@ -42,3 +42,25 @@ ALLOW_ALL = os.getenv('ALLOW_ALL', 'false').lower() in {'1', 'true', 'yes', 'on'
 YT_COOKIES_FILE = os.getenv('YT_COOKIES_FILE')
 YT_COOKIES_B64 = os.getenv('YT_COOKIES_B64')
 YTDLP_PROXY = os.getenv('YTDLP_PROXY')
+
+# Invidious/Piped instances (comma-separated in env), with defaults
+_inv_raw = os.getenv('INVIDIOUS_INSTANCES', '').strip()
+if _inv_raw:
+    INVIDIOUS_INSTANCES = [x.strip() for x in _inv_raw.split(',') if x.strip()]
+else:
+    INVIDIOUS_INSTANCES = [
+        'https://yewtu.be',
+        'https://inv.tux.pizza',
+        'https://invidious.privacydev.net',
+        'https://vid.puffyan.us',
+    ]
+
+_piped_raw = os.getenv('PIPED_INSTANCES', '').strip()
+if _piped_raw:
+    PIPED_INSTANCES = [x.strip() for x in _piped_raw.split(',') if x.strip()]
+else:
+    PIPED_INSTANCES = [
+        'https://piped.video',
+        'https://piped.mha.fi',
+        'https://piped.tokhmi.xyz',
+    ]
