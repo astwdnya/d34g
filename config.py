@@ -34,3 +34,11 @@ if _auth_users_raw:
         AUTHORIZED_USERS = set()
 
 ALLOW_ALL = os.getenv('ALLOW_ALL', 'false').lower() in {'1', 'true', 'yes', 'on'}
+
+# yt-dlp / YouTube configuration
+# Optional: Provide cookies to bypass login/anti-bot prompts
+# YT_COOKIES_FILE: absolute path to a Netscape cookies.txt file inside the container
+# YT_COOKIES_B64: base64-encoded contents of a Netscape cookies.txt; will be written to /tmp/yt_cookies.txt
+YT_COOKIES_FILE = os.getenv('YT_COOKIES_FILE')
+YT_COOKIES_B64 = os.getenv('YT_COOKIES_B64')
+YTDLP_PROXY = os.getenv('YTDLP_PROXY')

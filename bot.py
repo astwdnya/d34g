@@ -5,6 +5,7 @@ import aiohttp
 import mimetypes
 import tempfile
 import time
+import base64
 from urllib.parse import urlparse
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +21,8 @@ from config import (
     BRIDGE_CHANNEL_ID,
     AUTHORIZED_USERS as CFG_AUTH_USERS,
     ALLOW_ALL,
+    YT_COOKIES_FILE,
+    YT_COOKIES_B64,
 )
 try:
     from uploader import upload_to_bridge
@@ -64,6 +67,8 @@ class TelegramDownloadBot:
                     print("🔓 ALLOW_ALL is enabled (temporary). All users can use the bot.")
                 else:
                     print(f"👤 Authorized users: {sorted(self.authorized_users)}")
+                if self.yt_cookies_path:
+                    print("🍪 YouTube cookies loaded for yt-dlp (to bypass anti-bot/login prompts)")
             except Exception as e:
                 print(f"⚠️ getMe failed: {e}")
 
@@ -73,6 +78,22 @@ class TelegramDownloadBot:
         default_users = {818185073, 6936101187, 7972834913}
         self.authorized_users = set(CFG_AUTH_USERS) if CFG_AUTH_USERS else default_users
         self.allow_all = bool(ALLOW_ALL)
+        # Prepare yt-dlp cookies if provided
+        self.yt_cookies_path = None
+        try:
+            if YT_COOKIES_B64:
+                try:
+                    data = base64.b64decode(YT_COOKIES_B64)
+                    self.yt_cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+                    with open(self.yt_cookies_path, "wb") as f:
+                        f.write(data)
+                except Exception as e:
+                    print(f"⚠️ Failed to decode YT_COOKIES_B64: {e}")
+                    self.yt_cookies_path = None
+            elif YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+                self.yt_cookies_path = YT_COOKIES_FILE
+        except Exception as e:
+            print(f"⚠️ Error preparing YouTube cookies: {e}")
         # token -> {file_path, filename, file_size, user_id, user_name, chat_id, progress_msg, update, job}
         self.pending_videos = {}
         # token -> {url, user_id, user_name, chat_id, progress_msg, update, job}
@@ -720,7 +741,12 @@ https://example.com/image.jpg
             heights = await self.ytdl_list_heights(url)
         except Exception as e:
             print(f"❌ yt-dlp extract error: {e}")
-            await processing_msg.edit_text("❌ خطا در واکشی کیفیت‌های یوتیوب. لطفاً لینک را بررسی کنید یا بعداً دوباره تلاش کنید.")
+            msg = "❌ خطا در واکشی کیفیت‌های یوتیوب."
+            if "Sign in to confirm" in str(e):
+                msg += "\nبرای بعضی لینک‌ها نیاز به کوکی یوتیوب هست. متغیرهای YT_COOKIES_FILE یا YT_COOKIES_B64 را تنظیم کنید."
+            msg += "\nلطفاً لینک را بررسی کنید یا بعداً دوباره تلاش کنید."
+            await processing_msg.edit_text(msg + "\nتلاش برای دانلود بهترین کیفیت …")
+            await self.on_ytdl_download_and_send(update, context, processing_msg, url, None)
             return
 
         if not heights:
@@ -825,6 +851,23 @@ https://example.com/image.jpg
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+                'noplaylist': True,
+            }
+            if self.yt_cookies_path:
+                ydl_opts['cookiefile'] = self.yt_cookies_path
+            # Optional proxy & headers
+            try:
+                from config import YTDLP_PROXY
+            except Exception:
+                YTDLP_PROXY = None
+            if YTDLP_PROXY:
+                ydl_opts['proxy'] = YTDLP_PROXY
+            ydl_opts['http_headers'] = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9,fa;q=0.8',
+                'Accept': '*/*',
+                'Referer': 'https://www.youtube.com/',
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -871,6 +914,23 @@ https://example.com/image.jpg
                     'outtmpl': prefix + '.%(ext)s',
                     'quiet': True,
                     'no_warnings': True,
+                    'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+                    'noplaylist': True,
+                }
+                if self.yt_cookies_path:
+                    ydl_opts['cookiefile'] = self.yt_cookies_path
+                # Optional proxy & headers
+                try:
+                    from config import YTDLP_PROXY
+                except Exception:
+                    YTDLP_PROXY = None
+                if YTDLP_PROXY:
+                    ydl_opts['proxy'] = YTDLP_PROXY
+                ydl_opts['http_headers'] = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9,fa;q=0.8',
+                    'Accept': '*/*',
+                    'Referer': 'https://www.youtube.com/',
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
